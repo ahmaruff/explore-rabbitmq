@@ -21,7 +21,7 @@ flowchart LR
     MGMT["Management UI<br/>localhost:15672"]
 ```
 
-Publisher and subscriber each declare the same quorum queue (`RABBITMQ_QUEUE`, default `hello`). Publishing uses the default exchange and a queue address, so there is no separate exchange or binding to manage.
+Publisher and subscriber each declare the same quorum queue (`RABBITMQ_QUEUE`, default `hello`). The publisher sends to that queue through an AMQP 1.0 queue address (`/queues/hello`), so the broker delivers the message straight to the queue. No exchange, routing key, or binding is involved; see [Exchange and routing](#exchange-and-routing).
 
 ## Repository layout
 
@@ -110,7 +110,7 @@ curl -N "http://localhost:8091/events"
 data: {"message":"hello rabbit"}
 ```
 
-Every publish is confirmed by the broker. `internal/rabbitmq.Publish` checks the outcome and reports `accepted` or `rejected`; a rejected message returns HTTP `500` to the caller.
+Every publish is confirmed by the broker. `internal/rabbitmq.Publish` checks the outcome and reports `accepted` or `rejected`; a rejected message returns HTTP `500` to the caller. Any other outcome, such as `released` for an unroutable message, also returns HTTP `500`.
 
 ## Development with hot reload
 
@@ -156,7 +156,7 @@ Only these variables are read and validated by `pub` and `sub` (`Config.Validate
 | Variable | Default | Description |
 | --- | --- | --- |
 | `RABBITMQ_BROKER_URI` | - | Required. AMQP URI, e.g. `amqp://guest:guest@rabbitmq:5672/` |
-| `RABBITMQ_QUEUE` | `hello` | Quorum queue declared and used by both services |
+| `RABBITMQ_QUEUE` | `hello` | Quorum queue declared by both services; the publisher sends to it directly |
 | `HTTP_PORT` | `8090` | HTTP listen port |
 | `APP_NAME`, `APP_VERSION`, `APP_ENV` | template values | Attached to structured log entries |
 | `APP_URL` | - | Public origin reported by the template config; not used by the publisher or SSE pages |
@@ -175,9 +175,42 @@ The `.env.example` template also contains `DB_*`, `JWT_*`, and `STORAGE_*` entri
 
 Logs are written both to stdout (`docker compose logs -f`) and to the mounted directory.
 
+## Exchange and routing
+
+This demo does not use an exchange. Nothing in the code declares an exchange, sets a routing key, or creates a binding.
+
+| Piece | Status |
+| --- | --- |
+| Custom exchange (fanout, topic, direct) | Not implemented |
+| Publishing through `ExchangeAddress` | Not implemented |
+| Binding a queue to an exchange | Not implemented |
+| `RABBITMQ_EXCHANGE` configuration | Not implemented |
+| Routing key | Not implemented |
+| `StateReleased` (unroutable message) handling | Not implemented |
+
+`internal/rabbitmq.NewPublisher` publishes with `rmq.QueueAddress`, which the AMQP 1.0 client converts into the queue node `/queues/<name>`. The AMQP 0-9-1 "default exchange" does not apply here: the message never reaches an exchange, so there is no exchange routing to configure or inspect in the Management UI.
+
+Both commands declare `RABBITMQ_QUEUE` themselves (`cmd/pub/main.go`, `cmd/sub/main.go`), so the publisher knows the queue name even though it does not know how many consumers read from it.
+
+Consequences:
+
+- A single publish cannot fan out to several queues. That requires a fanout exchange bound to one queue per subscriber.
+- One queue means subscriber replicas compete for messages. Because the SSE hub is in memory, browsers attached to one replica never see messages consumed by another.
+- `rabbitmq.Publish` handles `StateAccepted` and `StateRejected`. An unroutable publish comes back as `StateReleased`, which currently falls into the generic `unexpected publish outcome` error.
+
+Adding exchange routing requires these changes:
+
+1. Declare a `FanOutExchangeSpecification` (or `TopicExchangeSpecification`) in `internal/rabbitmq`.
+2. Change `NewPublisher` from `QueueAddress` to `ExchangeAddress`.
+3. Declare one queue per subscriber and bind it with `ExchangeToQueueBindingSpecification`.
+4. Add `RABBITMQ_EXCHANGE` to `Config` and drop the queue from the publisher.
+5. Handle `StateReleased` explicitly in `Publish`.
+
+The publisher and subscriber routes, handlers, and SSE hub do not change.
+
 ## Behaviour and limitations
 
-- Messages go to one queue, so multiple subscriber instances compete for messages instead of each receiving a copy. For fan-out, publish to a fanout exchange with one queue per subscriber.
+- Messages go to one queue, so multiple subscriber instances compete for messages instead of each receiving a copy. Fan-out needs an exchange; see [Exchange and routing](#exchange-and-routing).
 - The SSE hub and its 50-message history are per subscriber process and reset on restart.
 - The subscriber accepts a message after the handler succeeds and requeues it when the handler returns an error. There is no retry limit or dead-letter queue, so a handler that always fails creates a redelivery loop. The current handler always returns `nil`.
 - `depends_on` only controls startup order; it does not wait for RabbitMQ to be ready. `restart: unless-stopped` lets the production-like services recover after an early connection failure.
