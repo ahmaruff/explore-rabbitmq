@@ -38,6 +38,9 @@ type Config struct {
 	JWTTTLMinutes int
 
 	Storage StorageConfig
+
+	BrokerURI string
+	QueueName string
 }
 
 const (
@@ -117,6 +120,9 @@ func LoadConfig() (Config, error) {
 			SigningKey:       os.Getenv("STORAGE_SIGNING_KEY"),
 			RequireSignature: mustBool("STORAGE_REQUIRE_SIGNATURE", false),
 		},
+
+		BrokerURI: os.Getenv("RABBITMQ_BROKER_URI"),
+		QueueName: getEnv("RABBITMQ_QUEUE", "hello"),
 	}
 
 	if err := errors.Join(problems...); err != nil {
@@ -179,6 +185,31 @@ func (c Config) Validate() error {
 
 	if c.Storage.RequireSignature && c.Storage.SigningKey == "" {
 		problems = append(problems, "STORAGE_SIGNING_KEY is required when STORAGE_REQUIRE_SIGNATURE=true")
+	}
+
+	if len(problems) > 0 {
+		return fmt.Errorf("invalid configuration: %s", strings.Join(problems, "; "))
+	}
+
+	return nil
+}
+
+// ValidateBroker validates only the configuration used by the pub and sub commands.
+func (c Config) ValidateBroker() error {
+	var problems []string
+
+	if strings.TrimSpace(c.HTTPPort) == "" {
+		problems = append(problems, "HTTP_PORT is required")
+	} else if port, err := strconv.Atoi(c.HTTPPort); err != nil || port < 1 || port > 65535 {
+		problems = append(problems, "HTTP_PORT must be a number between 1 and 65535")
+	}
+
+	if strings.TrimSpace(c.BrokerURI) == "" {
+		problems = append(problems, "RABBITMQ_BROKER_URI is required")
+	}
+
+	if strings.TrimSpace(c.QueueName) == "" {
+		problems = append(problems, "RABBITMQ_QUEUE is required")
 	}
 
 	if len(problems) > 0 {

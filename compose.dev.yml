@@ -1,0 +1,45 @@
+services:
+  rabbitmq:
+    image: rabbitmq:4-management
+    ports:
+      - "5672:5672"    # AMQP
+      - "15672:15672"  # Management dashboard
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+
+  publisher:
+    build:
+      context: ./example-go
+      dockerfile: Dockerfile.dev
+    command: ["air", "-c", ".air.pub.toml"]
+    env_file:
+      - ./example-go/.env.pub
+    ports:
+      - "8090:8090"
+    volumes:
+      - ./example-go:/app
+      - ./logs/pub:/app/logs
+      - go_mod_cache:/go/pkg/mod
+    depends_on:
+      - rabbitmq
+
+  subscriber:
+    build:
+      context: ./example-go
+      dockerfile: Dockerfile.dev
+    command: ["air", "-c", ".air.sub.toml"]
+    env_file:
+      - ./example-go/.env.sub
+    ports:
+      - "8091:8091"
+    volumes:
+      - ./example-go:/app
+      - ./logs/sub:/app/logs
+      - go_mod_cache:/go/pkg/mod
+    depends_on:
+      - rabbitmq
+
+volumes:
+  rabbitmq_data:
+  go_mod_cache:
+

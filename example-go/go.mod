@@ -10,6 +10,7 @@ require (
 	github.com/jackc/pgx/v5 v5.11.0
 	github.com/joho/godotenv v1.5.1
 	github.com/labstack/echo/v5 v5.4.0
+	github.com/rabbitmq/rabbitmq-amqp-go-client v1.5.0
 	github.com/rs/zerolog v1.35.1
 	github.com/sym01/htmlsanitizer v1.1.1
 	gocloud.dev v0.47.0
@@ -17,6 +18,7 @@ require (
 
 require (
 	filippo.io/edwards25519 v1.2.0 // indirect
+	github.com/Azure/go-amqp v1.7.0 // indirect
 	github.com/aws/aws-sdk-go-v2 v1.46.0 // indirect
 	github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream v1.7.20 // indirect
 	github.com/aws/aws-sdk-go-v2/config v1.33.3 // indirect
@@ -45,6 +47,7 @@ require (
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/google/wire v0.7.0 // indirect
 	github.com/googleapis/gax-go/v2 v2.24.1 // indirect
+	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
 	github.com/jackc/puddle/v2 v2.2.2 // indirect

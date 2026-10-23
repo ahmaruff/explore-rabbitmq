@@ -12,13 +12,12 @@ import (
 
 	"rabbitmq-example/internal/platform/config"
 	"rabbitmq-example/internal/platform/db"
-	"rabbitmq-example/internal/platform/files"
 	platformhttp "rabbitmq-example/internal/platform/http"
 	"rabbitmq-example/internal/platform/logger"
-	"rabbitmq-example/internal/platform/storage"
 
 	"rabbitmq-example/internal/auth"
-	"rabbitmq-example/internal/hello"
+	internalrmq "rabbitmq-example/internal/rabbitmq"
+	"rabbitmq-example/internal/sub"
 
 	"github.com/joho/godotenv"
 )
@@ -37,72 +36,42 @@ func run() error {
 		return err
 	}
 
-	// start logger
 	if logErr := setupLogger(cfg); logErr != nil {
 		logger.L().Warn().Err(logErr).Msg("file logging disabled, stdout only")
 	}
-
 	defer logger.Close()
 
 	startupCtx, cancelStartup := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancelStartup()
 
-	// database, err := openDatabase(cfg)
-	// if err != nil {
-	// 	logger.L().Error().Stack().Err(err).Msg("Failed to connect database")
-	// 	return err
-	// }
-
-	// defer database.Close()
-
 	server := platformhttp.NewServer(cfg.HTTPPort)
 
-	// jwtService, err := setupJWTService(cfg)
-
-	// if err != nil {
-	// 	logger.L().Error().Stack().Err(err).Msg("Failed to setup JWT")
-	// 	return err
-	// }
-
-	// SETUP STORAGE
-	fileStore, err := storage.New(startupCtx, cfg.Storage)
+	rmqEnv, rmqConn, err := internalrmq.NewConnection(startupCtx, cfg.BrokerURI)
 	if err != nil {
-		logger.L().Error().Stack().Err(err).Msg("Failed to setup storage")
+		logger.L().Error().Stack().Err(err).Msg("Failed to connect to RabbitMQ")
+		return err
+	}
+	defer func() {
+		if err := internalrmq.CloseConnection(rmqEnv); err != nil {
+			logger.L().Error().Stack().Err(err).Msg("Failed to close RabbitMQ")
+		}
+	}()
+
+	if _, err := internalrmq.NewQueue(startupCtx, rmqConn, cfg.QueueName); err != nil {
+		logger.L().Error().Stack().Err(err).Msg("Failed to declare queue")
 		return err
 	}
 
-	defer fileStore.Close()
-
-	// SETUP FILES
-	fileService, err := files.New(files.Config{
-		Store:            fileStore,
-		BaseURL:          cfg.AppURL,
-		SigningKey:       cfg.Storage.SigningKey,
-		RequireSignature: cfg.Storage.RequireSignature,
-	})
+	consumer, err := internalrmq.NewConsumer(startupCtx, rmqConn, cfg.QueueName)
 	if err != nil {
-		logger.L().Error().Stack().Err(err).Msg("Failed to setup files")
+		logger.L().Error().Stack().Err(err).Msg("Failed to create consumer")
 		return err
 	}
-
-	// SETUP REPOSITORY
-	// userRepository := auth.NewUserRepository(database)
-	// authService := auth.NewUserService(userRepository)
-
-	// SETUP SERVICE
-
-	// REGISTER ROUTES
-	// protected := auth.JWTMiddleware(jwtService)
-
-	hello.RegisterRoutes(server.Echo())
-	// health.RegisterRoutes(server.Echo(), database)
-	// auth.RegisterRoutes(server.Echo(), protected, authService)
-
-	server.Static(files.RoutePattern, files.RoutePrefix, fileService)
-
-	logger.L().Info().
-		Str("address", server.Address()).
-		Msg("HTTP server starting")
+	defer func() {
+		if err := internalrmq.CloseConsumer(consumer); err != nil {
+			logger.L().Error().Stack().Err(err).Msg("Failed to close consumer")
+		}
+	}()
 
 	ctx, stop := signal.NotifyContext(
 		context.Background(),
@@ -111,22 +80,37 @@ func run() error {
 	)
 	defer stop()
 
+	handler := sub.NewHandler()
+	sub.RegisterRoutes(server.Echo(), handler)
+
+	go func() {
+		err := internalrmq.Consume(ctx, consumer, func(_ context.Context, body []byte) error {
+			handler.Broadcast(string(body))
+			return nil
+		})
+		if err != nil {
+			logger.L().Error().Stack().Err(err).Msg("Consumer stopped")
+		}
+	}()
+
+	logger.L().Info().
+		Str("address", server.Address()).
+		Msg("Subscriber HTTP server starting")
+
 	if err := server.Start(ctx); err != nil {
 		logger.L().Error().Stack().Err(err).Msg("HTTP server failed")
 		return fmt.Errorf("Failed to start HTTP server: %w", err)
 	}
 
-	logger.L().Info().Msg("HTTP server stopped")
+	logger.L().Info().Msg("Subscriber HTTP server stopped")
 	return nil
 }
 
 func loadConfig() (config.Config, error) {
-	if err := godotenv.Load(); err != nil {
+	if err := godotenv.Load(".env.sub"); err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
 			return config.Config{}, fmt.Errorf("failed to load config: %w", err)
 		}
-
-		// return config.Config{}, fmt.Errorf("Failed to load config: %w", err)
 	}
 
 	cfg, err := config.LoadConfig()
@@ -134,7 +118,7 @@ func loadConfig() (config.Config, error) {
 		return config.Config{}, err
 	}
 
-	if err := cfg.Validate(); err != nil {
+	if err := cfg.ValidateBroker(); err != nil {
 		return config.Config{}, err
 	}
 
@@ -142,7 +126,6 @@ func loadConfig() (config.Config, error) {
 }
 
 func setupLogger(cfg config.Config) error {
-
 	return logger.Init(logger.Config{
 		Env:         cfg.AppEnv,
 		Level:       cfg.LogLevel,

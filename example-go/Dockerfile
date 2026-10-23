@@ -7,15 +7,29 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=0 go build -o /server ./cmd/api
 
-# Runtime stage
-FROM alpine:3.22
+# Build publisher binary
+RUN CGO_ENABLED=0 go build -o /pub ./cmd/pub
+
+# Build subscriber binary
+RUN CGO_ENABLED=0 go build -o /sub ./cmd/sub
+
+
+# Publisher runtime image
+FROM alpine:3.22 AS pub
 
 WORKDIR /app
 
-COPY --from=builder /server ./server
+COPY --from=builder /pub ./pub
 
-EXPOSE 8090
+CMD ["./pub"]
 
-CMD ["./server"]
+
+# Subscriber runtime image
+FROM alpine:3.22 AS sub
+
+WORKDIR /app
+
+COPY --from=builder /sub ./sub
+
+CMD ["./sub"]

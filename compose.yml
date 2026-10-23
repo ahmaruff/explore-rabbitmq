@@ -1,0 +1,57 @@
+services:
+  rabbitmq:
+    image: rabbitmq:4-management
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:?RABBITMQ_USER is required}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?RABBITMQ_PASSWORD is required}
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+
+    # Optional: expose RabbitMQ to the host.
+    # Keep disabled unless external access is required.
+    ports:
+      - "5672:5672"    # AMQP
+      - "15672:15672"  # Management dashboard
+
+  publisher:
+    build:
+      context: ./example-go
+      dockerfile: Dockerfile
+      target: pub
+    restart: unless-stopped
+    env_file:
+      - ./example-go/.env.pub
+    depends_on:
+      - rabbitmq
+    volumes:
+      - ./logs/pub:/app/logs
+      - uploads:/app/storage/uploads
+
+    # Optional: publish the application port to the host.
+    ports:
+      - "8090:8090"
+
+  subscriber:
+    build:
+      context: ./example-go
+      dockerfile: Dockerfile
+      target: sub
+    restart: unless-stopped
+    env_file:
+      - ./example-go/.env.sub
+    depends_on:
+      - rabbitmq
+    volumes:
+      - ./logs/sub:/app/logs
+      - uploads:/app/storage/uploads
+
+    # Optional: publish the application port to the host.
+    ports:
+      - "8091:8091"
+
+volumes:
+  rabbitmq_data:
+  uploads:
+
+

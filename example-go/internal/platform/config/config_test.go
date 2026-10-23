@@ -17,6 +17,8 @@ func validConfig() Config {
 		Storage: StorageConfig{
 			Driver: StorageDriverLocal,
 		},
+		BrokerURI: "amqp://guest:guest@localhost:5672/",
+		QueueName: "hello",
 	}
 }
 
