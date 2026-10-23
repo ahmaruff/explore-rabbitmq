@@ -1,12 +1,23 @@
 .git/
+.gitignore
+.dockerignore
+
+# Secrets: keep the template, never send real env files to the daemon.
 .env
 .env.*
 !.env.example
 
+# Runtime output from local runs and Compose bind mounts.
 logs/
-*.log
-
 storage/
+**/logs/
+**/storage/
+**/tmp/
+
+# Documentation and Compose files are not needed inside an image.
+README.md
+docs/
+compose*.yml
 
 bin/
 dist/

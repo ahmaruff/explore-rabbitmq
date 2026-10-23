@@ -4,6 +4,8 @@
 ### dotenv ###
 .env
 .env.*
+# Keep the committed template; real files stay local.
+!.env.example
 
 ### Git ###
 # Created by git for backups. To disable backups in Git:
@@ -64,8 +66,12 @@ go.work
 
 # End of https://www.toptal.com/developers/gitignore/api/go,visualstudiocode,dotenv,git
 
-logs/*
+# Runtime output
+logs/
+storage/
+tmp/
 
-/tmp/
-/storage/
+# OS junk
+.DS_Store
+Thumbs.db
 

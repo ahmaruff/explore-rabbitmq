@@ -7,6 +7,10 @@ logs/
 *.log
 
 storage/
+tmp/
+
+docs/
+README.md
 
 bin/
 dist/
