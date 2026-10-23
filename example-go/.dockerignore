@@ -1,0 +1,14 @@
+.git/
+.env
+.env.*
+!.env.example
+
+logs/
+*.log
+
+storage/
+
+bin/
+dist/
+*.exe
+*.test

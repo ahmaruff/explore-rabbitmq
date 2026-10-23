@@ -1,0 +1,42 @@
+root = "."
+tmp_dir = "tmp"
+
+[build]
+cmd = "go build -o ./tmp/main ./cmd/api"
+entrypoint = ["./tmp/main"]
+
+# Add additional arguments when running binary (bin/full_bin). Will run './tmp/main hello world'.
+args_bin = []
+
+include_ext = ["go", "tpl", "tmpl", "html"]
+exclude_dir = ["tmp", "storage", "vendor", "logs", ".git", "assets"]
+exclude_regex = ["_test\\.go"]
+exclude_unchanged = true
+follow_symlink = true
+
+# Poll files for changes instead of using fsnotify.
+poll = true
+# Poll interval (defaults to the minimum interval of 500ms).
+poll_interval = 500 # ms
+# It's not necessary to trigger build each time file changes if it's too frequent.
+delay = 0 # ms
+
+# Stop running old binary when build errors occur.
+stop_on_error = true
+# Send Interrupt signal before killing process (ignored on Windows; uses TASKKILL)
+send_interrupt = true
+# Delay after sending Interrupt signal
+kill_delay = "500ms"
+
+[log]
+time = true
+main_only = false
+silent = false
+
+[misc]
+clean_on_exit = true
+startup_banner = ""
+
+[screen]
+clear_on_rebuild = false
+keep_scroll = true
