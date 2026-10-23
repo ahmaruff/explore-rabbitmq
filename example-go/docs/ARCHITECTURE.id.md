@@ -1,15 +1,14 @@
-# Sucor Go API: Arsitektur dan Aturan Tim
+# Example Go API: Arsitektur dan Aturan Tim
 
-Status: work in progress. Service ini adalah rewrite dari API Laravel yang sudah ada.
-
-Tujuan dokumen ini: menjelaskan cara menambah module, cara wiring, dan batasan yang tidak boleh dilanggar. Dokumen ini berisi aturan yang berlaku jangka panjang, bukan daftar endpoint yang ada saat ini.
+Status: living document. Dokumen ini menjelaskan cara menambah module, cara wiring, dan batasan yang tidak boleh dilanggar. Isinya aturan jangka panjang, bukan daftar endpoint yang ada saat ini.
 
 ## 1. Konteks
 
-- API Laravel adalah referensi produk. Behavior baru harus sama dengan Laravel 1:1, kecuali ada deviation yang disetujui.
-- Saat ini database migration dimiliki dan dijalankan oleh Laravel. Repository ini tidak membuat atau menjalankan migration.
-- PostgreSQL schema adalah external contract yang dikelola Laravel. Jangan mengubah schema dari Go.
-- Rewrite belum selesai. Komentar TODO di code menandai flow yang masih harus di-port.
+- Repo ini adalah REST API Go yang dipakai sebagai contoh dan titik awal untuk service baru.
+- Entry point ada di `cmd/api`; nama Go module adalah `rabbitmq-example`.
+- Stack utama: Echo v5 untuk HTTP, zerolog + timberjack untuk logging, `database/sql` dengan driver pgx untuk PostgreSQL (driver MySQL juga tersedia di `platform/db`), JWT HS256, go-playground/validator, dan abstraksi storage dengan driver local disk atau S3.
+- Konfigurasi dibaca dari environment variable. `godotenv` memuat `.env` saat development.
+- Beberapa komponen sudah tersedia tetapi wiring-nya masih dikomentari di `main.go`: database, JWT service, `health`, dan `auth`. Helper `openDatabase` dan `setupJWTService` sudah siap dipakai saat komponen itu diaktifkan.
 
 ## 2. Architecture style
 
@@ -43,13 +42,13 @@ Implikasi dari pendekatan ini:
 - `main.go` adalah satu-satunya tempat yang tahu semua concrete type.
 - Core bisa di-test dengan stub karena tidak punya dependency ke infrastructure.
 
-Project ini sengaja memakai **consumer-declared port**, bukan satu package `ports` di tengah. Module yang membutuhkan capability mendeklarasikan interface paling kecil yang dia butuhkan. Ini menjaga module tetap independen dan menghindari shared package yang di-import semua module.
+Project ini sengaja memakai **consumer-declared port**, bukan satu package `ports` di tengah. Module yang membutuhkan capability mendeklarasikan interface paling kecil yang dia butuhkan. Ini menjaga module tetap independen dan menghindari shared package yang di-import semua module. Module kecil boleh mendeklarasikan port di file yang memakainya; contoh `Pinger` di `internal/health/handler.go`.
 
 ## 3. Struktur module
 
-Module adalah satu feature folder di dalam `internal/`. Satu folder adalah satu Go package.
+Module adalah satu feature folder di dalam `internal/`. Satu folder adalah satu Go package. Module yang ada saat ini: `auth`, `health`, dan `hello`.
 
-Struktur standar untuk module yang punya business rule dan persistence:
+Struktur standar untuk module yang punya business rule dan persistence. Module kecil hanya memakai file yang dibutuhkannya:
 
 ```text
 internal/event/
@@ -76,7 +75,7 @@ internal/event/
 
 Aturan:
 
-1. Jangan membuat subpackage untuk satu feature kecuali feature benar-benar independen. Pisahkan file berdasarkan concern. Contoh di `internal/post`: `comment_*.go` dan `postlike_*.go`.
+1. Jangan membuat subpackage untuk satu feature kecuali feature benar-benar independen. Pisahkan file berdasarkan concern. Contoh di `internal/auth`: `jwt.go`, `middleware.go`, `repository.go`, dan `service.go`.
 2. Nama package harus sama dengan nama folder.
 3. Feature-specific code tetap di feature. Jangan pindahkan ke `platform` hanya karena "mungkin bisa dipakai ulang".
 4. Jangan import type, error, atau service dari module lain. Gunakan port. Lihat bagian 4.
@@ -107,10 +106,9 @@ flowchart LR
 
 Contoh dari code saat ini:
 
-- `internal/post` mendeklarasikan `MembershipChecker` dan `UserStatusReader` di `domain.go` miliknya.
-- `community.Service` memenuhi `MembershipChecker` secara struktural; repository-nya hanya membaca data membership dan service yang memutuskan policy posting.
-- `auth.UserRepository` memenuhi `UserStatusReader` secara struktural.
-- `main.go` meng-inject keduanya ke post service. `internal/post` tidak pernah import `internal/community` atau `internal/auth`.
+- `cmd/api` membuat middleware dengan `auth.JWTMiddleware(jwtService)`, lalu mengirimnya sebagai parameter ke `RegisterRoutes`. File route menerima middleware itu tanpa perlu import `internal/auth`.
+- Module yang butuh data dari module lain mendeklarasikan port kecil di `domain.go` miliknya sendiri, dan `main.go` yang menyuntikkan implementasinya.
+- `platform/identity` menyimpan hasil authentication di request context, sehingga module tidak perlu tahu cara token dibuat atau divalidasi.
 
 Kalau method set provider tidak cocok dengan port:
 
@@ -126,44 +124,59 @@ Enforcement: code review wajib menolak import antar feature. Kalau nanti menamba
 
 `cmd/api/main.go` adalah composition root. Hanya file ini yang boleh tahu semua concrete implementation.
 
-Urutan wiring:
+Urutan wiring yang dipakai saat ini:
 
 ```text
-config -> logger -> database -> repositories -> shared services -> feature services -> routes -> server start
+config -> logger -> storage -> files -> routes -> server start
 ```
 
-Bentuk wiring:
+Jika database dan authentication diaktifkan, urutannya menjadi:
+
+```text
+config -> logger -> database -> repositories -> services -> middleware -> routes -> server start
+```
+
+Bentuk wiring di `cmd/api/main.go`:
 
 ```go
-cfg, err := config.LoadConfig()
+cfg, err := loadConfig()
 
-database, err := db.NewPostgres(db.DBConfig{...})
-defer database.Close()
+setupLogger(cfg)
+defer logger.Close()
 
 startupCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 defer cancel()
 
-profanityRepository := profanity.NewRepository(database)
-profanityService, err := profanity.NewService(startupCtx, profanityRepository)
+server := platformhttp.NewServer(cfg.HTTPPort)
 
-contentCleaner := contentcleaner.New()
+fileStore, err := storage.New(startupCtx, cfg.Storage)
+defer fileStore.Close()
 
-postRepository := post.NewPostRepository(database)
-commentRepository := post.NewCommentRepository(database)
-postLikeRepository := post.NewPostLikeRepository(database)
-communityRepository := community.NewCommunityRepository(database)
-communityService := community.NewService(communityRepository)
+fileService, err := files.New(files.Config{
+    Store:            fileStore,
+    BaseURL:          cfg.AppURL,
+    SigningKey:       cfg.Storage.SigningKey,
+    RequireSignature: cfg.Storage.RequireSignature,
+})
+
+hello.RegisterRoutes(server.Echo())
+server.Static(files.RoutePattern, files.RoutePrefix, fileService)
+```
+
+Bagian database dan auth sudah disiapkan tetapi masih dikomentari:
+
+```go
+database, err := openDatabase(cfg)
+defer database.Close()
+
+jwtService, err := setupJWTService(cfg)
+
 userRepository := auth.NewUserRepository(database)
 authService := auth.NewUserService(userRepository)
-
-postService := post.NewService(postRepository, communityService, userRepository, contentCleaner, profanityService)
-commentService := post.NewCommentService(postRepository, commentRepository, communityService, userRepository, contentCleaner, profanityService)
-postLikeService := post.NewPostLikeService(postRepository, postLikeRepository, communityService, userRepository)
-
 protected := auth.JWTMiddleware(jwtService)
 
+health.RegisterRoutes(server.Echo(), database)
 auth.RegisterRoutes(server.Echo(), protected, authService)
-post.RegisterRoutes(server.Echo(), protected, postService, commentService, postLikeService)
 ```
 
 Aturan:
@@ -176,6 +189,7 @@ Aturan:
 6. Validasi config wajib saat startup (JWT secret, TTL, koneksi database) dan fail fast.
 7. Daftarkan route setelah semua service siap.
 8. Side effect startup tetap di `main.go`: config, logger, database, background loader.
+9. Shutdown lewat `signal.NotifyContext` dan `server.Start(ctx)`; biarkan server menyelesaikan request yang sedang jalan (graceful timeout 10 detik).
 
 ## 6. Menambah module baru
 
@@ -196,9 +210,9 @@ import (
 )
 
 type Event struct {
-    ID          int       `json:"id"`
-    CommunityID int       `json:"community_id"`
-    CreatedAt   time.Time `json:"created_at"`
+    ID        int       `json:"id"`
+    UserID    string    `json:"user_id"`
+    CreatedAt time.Time `json:"created_at"`
 }
 
 type Repository interface {
@@ -206,8 +220,8 @@ type Repository interface {
     CreateEvent(ctx context.Context, params CreateEventParams) (*Event, error)
 }
 
-type MembershipChecker interface {
-    IsMember(ctx context.Context, communityID int, userID int) (bool, error)
+type UserStatusReader interface {
+    IsActive(ctx context.Context, userID string) (bool, error)
 }
 ```
 
@@ -215,7 +229,7 @@ Deklarasikan hanya method yang benar-benar dipakai module. Port bukan salinan re
 
 ### Step 3: implementasikan repository adapter
 
-- Gunakan placeholder `$1`.
+- Gunakan placeholder sesuai driver: `$1` untuk PostgreSQL/pgx, `?` untuk MySQL.
 - `ctx` selalu jadi argumen pertama.
 - Wrap DB error dengan sentinel dan `%w`.
 - Pasang stack sekali di tempat error dibuat: `logger.WithStack(...)`.
@@ -227,14 +241,14 @@ Deklarasikan hanya method yang benar-benar dipakai module. Port bukan salinan re
 
 - Terima port lewat constructor.
 - Terapkan business rule dan kembalikan sentinel error.
-- Bersihkan setiap string dari user dengan urutan: trim, `Clean`, `Filter`, lalu cek empty dan length.
+- Bersihkan setiap string dari user sebelum disimpan, lalu cek empty dan length setelah cleaning. `platform/contentcleaner` menyediakan trim, sanitize HTML, linkify, dan masking email/phone.
 - Jangan menulis SQL, HTTP status code, atau type dari `echo`.
 
 ### Step 5: definisikan error dan mapping
 
 - Satu sentinel untuk satu business rule.
 - Satu branch `MapError` untuk setiap sentinel.
-- Status code dan message harus sama dengan Laravel.
+- Status code dan message harus konsisten dengan kontrak API.
 - Error level field mengembalikan `422` dengan map `errors` yang key-nya JSON field.
 
 ### Step 6: implementasikan handler
@@ -243,7 +257,7 @@ Deklarasikan hanya method yang benar-benar dipakai module. Port bukan salinan re
 - Validate dengan `c.Validate`; failure mengembalikan `422`.
 - Pakai tag `notblank` yang sudah ada untuk menolak string berisi spasi saja.
 - Kalau menambah validation tag baru, tambahkan case di `platform/http/validator.go`.
-- Baca user ID numerik dengan `identity.UserIDInt(c)`; pakai `identity.UserID(c)` hanya kalau butuh subject string mentah.
+- Baca user ID dengan `identity.UserID(c)` atau `identity.UserIDInt(c)`. Keduanya mengembalikan `(value, bool)`; anggap `false` sebagai `401`.
 - Kembalikan semua error service lewat `writeError` milik module.
 
 ### Step 7: daftarkan route
@@ -263,12 +277,12 @@ func RegisterRoutes(e *echo.Echo, protected echo.MiddlewareFunc, service *Servic
 
 ```go
 eventRepository := event.NewEventRepository(database)
-eventService := event.NewService(eventRepository, communityRepository)
+eventService := event.NewService(eventRepository, userStatusReader)
 
 event.RegisterRoutes(server.Echo(), protected, eventService)
 ```
 
-Kalau `communityRepository` tidak memenuhi `event.MembershipChecker`, buat adapter di `main.go` dan inject adapter tersebut. Jangan import `community` dari `event`.
+Kalau provider tidak memenuhi port yang dideklarasikan `event`, buat adapter di `main.go` lalu inject adapter tersebut. Jangan import provider dari package `event`.
 
 ### Step 9: test
 
@@ -284,7 +298,7 @@ Kalau `communityRepository` tidak memenuhi `event.MembershipChecker`, buat adapt
 | Package | Capability |
 | --- | --- |
 | `platform/config` | Load environment variable ke `Config` yang typed. Tambahkan variable baru di sini. |
-| `platform/db` | Buka PostgreSQL lewat pgx dan atur connection pool. Mengembalikan `*sql.DB`. |
+| `platform/db` | Buka PostgreSQL lewat pgx (dan MySQL lewat go-sql-driver), atur connection pool, lalu ping saat startup. Mengembalikan `*sql.DB`. |
 | `platform/logger` | Process logger, request-scoped logger, error helper, one-time stack attachment. |
 | `platform/http` | Echo server, middleware stack, response envelope, request validator, central `HTTPErrorHandler`. |
 | `platform/identity` | Menyimpan dan membaca user ID hasil authentication di request context. |
@@ -295,7 +309,24 @@ Kalau `communityRepository` tidak memenuhi `event.MembershipChecker`, buat adapt
 
 `internal/platform/http` punya nama package `http`, jadi import sebagai `platformhttp` supaya tidak menimpa standard library.
 
-`auth`, `community`, dan `profanity` adalah module, bukan platform. Depend lewat port dan inject di `main.go`.
+Semua response JSON memakai envelope yang sama. `success` bernilai `true` saat `code < 400`, dan `errors` hanya muncul pada validation failure:
+
+```json
+{
+  "success": false,
+  "code": 422,
+  "message": "The given data was invalid.",
+  "errors": {
+    "content": ["The content field is required."]
+  }
+}
+```
+
+Error dari framework (404, 405, 413) dan panic yang di-recover juga lewat handler yang sama, jadi bentuk response tetap konsisten. Pengecualian: `platform/files` mengirim byte file lewat `http.ServeContent`, jadi memakai semantics `net/http` (Range, HEAD), bukan envelope.
+
+`NewServer` memasang middleware dengan urutan: `RequestID`, request logger context, `Recover`, `BodyLimit` 2 MiB, lalu access log. Validator dan `HTTPErrorHandler` juga didaftarkan di sana, jadi feature tidak perlu memasangnya sendiri.
+
+`auth`, `health`, dan `hello` adalah module, bukan platform. Depend lewat port dan inject di `main.go`.
 
 API yang sering dipakai:
 
@@ -310,8 +341,8 @@ logger.Ctx(ctx)         // di dalam request; sudah membawa request_id
 logger.Err(ctx, err)    // log sekali di decision boundary
 logger.WithStack(err)   // sekali, di tempat error dibuat
 
-identity.UserID(c)      // string subject dari JWT
-identity.UserIDInt(c)   // subject numerik, kalau sub berupa angka
+identity.UserID(c)      // (string, bool) subject dari JWT
+identity.UserIDInt(c)   // (int, bool) subject numerik, kalau sub berupa angka
 ```
 
 Ke mana code baru harus diletakkan:
@@ -333,7 +364,7 @@ Aturan untuk `platform`:
 5. Tambahkan test saat menambah capability platform.
 6. Jangan membuat dumping ground bernama `common`, `helpers`, atau `utils`. Beri nama package sesuai capability.
 
-Shared service module seperti `profanity` bukan platform. Perlakukan seperti module lain: depend melalui interface dan inject di `main.go`.
+Shared service module bukan platform. Perlakukan seperti module lain: depend melalui interface dan inject di `main.go`.
 
 ## 8. Aturan tim
 
@@ -354,7 +385,7 @@ Shared service module seperti `profanity` bukan platform. Perlakukan seperti mod
 13. Tegakkan uniqueness dengan database constraint plus `ON CONFLICT` atau retry. Jangan bergantung pada check-then-insert.
 14. Gunakan transaction kalau satu request menulis ke beberapa table.
 15. Validasi config wajib saat startup dan fail fast.
-16. Samakan behavior dengan Laravel dan tambahkan test untuk aturan baru. `go vet ./...` dan `go test ./...` harus lulus.
+16. Tambahkan test untuk aturan baru. `go vet ./...`, `go test ./...`, dan `go build ./...` harus lulus.
 
 ### SEBAIKNYA
 
@@ -373,32 +404,10 @@ Shared service module seperti `profanity` bukan platform. Perlakukan seperti mod
 3. Jangan memakai package-level database handle atau service.
 4. Jangan menaruh business logic di handler "untuk sementara".
 5. Jangan import module feature lain, bahkan untuk satu type kecil.
-6. Jangan menambah migration atau schema change di sini.
 
-## 9. Laravel parity dan schema
+## 9. Docker
 
-Untuk setiap endpoint yang di-port, bandingkan:
-
-1. HTTP method dan route path.
-2. Authentication dan authorization rule.
-3. Validation rule dan JSON field key yang persis sama.
-4. Status code dan error message.
-5. Success response shape.
-6. Permission rule: membership, moderator/co-moderator, mute.
-7. Side effect: notification, mention, mission, referral, counter.
-8. Soft-delete behavior dan timestamp.
-9. Default ordering, filtering, dan pagination.
-
-Database schema dimiliki Laravel:
-
-1. Jangan menambah migration di sini.
-2. Kalau schema kurang column atau index, ajukan ke pemilik Laravel.
-3. Baca schema Laravel sebagai source of truth. Jangan menebak nama column atau type.
-4. Dokumentasikan deviation yang disetujui di pull request dan di komentar code yang singkat.
-
-## 10. Docker
-
-Jalankan dari root repository. Kedua compose file membaca `.env`.
+Jalankan dari root repository. Kedua compose file membaca `.env`, memakai container name `rabbitmq-example`, dan memetakan port `8090:8090`.
 
 Development dengan hot reload:
 
@@ -416,24 +425,26 @@ Perbedaan:
 
 | File | Behavior |
 | --- | --- |
-| `docker-compose.dev.yml` | Memakai `Dockerfile.dev`, mount source ke `/app`, dan menjalankan `air`. Perubahan code memicu rebuild. |
-| `docker-compose.yml` | Memakai `Dockerfile`, build binary, dan menjalankannya tanpa source mount. Pakai untuk memverifikasi build yang sebenarnya. |
+| `docker-compose.dev.yml` | Memakai `Dockerfile.dev` (image Go + `air`), mount seluruh source ke `/app`, dan menjalankan `air -c .air.toml`. Perubahan code memicu rebuild. |
+| `docker-compose.yml` | Memakai `Dockerfile` multi-stage: build binary di `golang:1.27-alpine`, lalu jalankan di `alpine` tanpa source. Pakai untuk memverifikasi build yang sebenarnya. |
 
-Keduanya expose port `8090`, memakai container name `rabbitmq-example`, dan menulis log ke `./logs`. Gunakan `docker logs -f rabbitmq-example` untuk mengikuti log. Rebuild dengan `--build` setelah mengubah dependency, Dockerfile, atau compose file.
+Keduanya menulis log ke `./logs` dan menyimpan upload ke `./storage/app`, jadi data itu tetap ada saat container di-rebuild. `HTTP_PORT` di `.env` harus sinkron dengan mapping port di compose file, dan `LOG_FILE` harus tetap berada di dalam `/app/logs`.
 
-## 11. Testing dan command
+PostgreSQL berjalan di host, sehingga `DB_HOST` harus `host.docker.internal` saat memakai Docker. Gunakan `docker logs -f rabbitmq-example` untuk mengikuti log. Rebuild dengan `--build` setelah mengubah dependency, Dockerfile, atau compose file.
+
+## 10. Testing dan command
 
 ```bash
 go vet ./...
 go test ./...
-go test ./internal/post -cover
+go test ./internal/auth -cover
 go build ./...
 ```
 
 Convention:
 
-- Service test memakai stub manual. Jangan menambah mocking library tanpa kesepakatan.
-- Repository test mencakup row mapping dengan fake `rowScanner`; tambahkan integration test kalau query perlu verifikasi SQL asli.
-- Route test memeriksa status code dan response envelope.
-- Health test memakai fake pinger.
+- Service dan consumer test memakai fake manual. Contoh: `fakeUserRepository` di `auth` dan `fakePinger` di `health`. Jangan menambah mocking library tanpa kesepakatan.
+- Repository test (kalau ditambahkan) mencakup row mapping dengan fake `rowScanner`; tambahkan integration test kalau query perlu verifikasi SQL asli.
+- Route test memakai `echo.New()` atau `platformhttp.NewServer("0")` plus `httptest`, lalu memeriksa status code dan response envelope.
+- Platform punya test sendiri untuk validator, response envelope, file serving dan signed URL, storage round trip, serta output logger. Jalankan juga saat mengubah `internal/platform`.
 - Tambahkan atau update test di pull request yang sama dengan perubahan aturan.

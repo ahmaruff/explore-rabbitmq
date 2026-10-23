@@ -1,15 +1,14 @@
-# Sucor Go API: Architecture and Team Guide
+# Example Go API: Architecture and Team Guide
 
-Status: work in progress. This service is a rewrite of an existing Laravel API.
-
-Purpose of this document: explain how to add a module, how to wire it, and which boundaries must never be crossed. It describes durable rules, not a list of current endpoints.
+Status: living document. This document explains how to add a module, how to wire it, and which boundaries must never be crossed. It describes durable rules, not a list of current endpoints.
 
 ## 1. Context
 
-- Laravel API is the product reference. New behavior must match Laravel 1:1 unless a deviation is approved.
-- Currently database migrations are owned by Laravel. This repository never creates or runs migrations.
-- The PostgreSQL schema is an external contract managed by Laravel. Never change it from Go.
-- The rewrite is incomplete. TODO comments in the code mark flows that still need to be ported.
+- This repository is a Go REST API used as an example and a starting point for new services.
+- The entry point is `cmd/api`; the Go module is named `rabbitmq-example`.
+- Main stack: Echo v5 for HTTP, zerolog + timberjack for logging, `database/sql` with the pgx driver for PostgreSQL (a MySQL driver is also available in `platform/db`), JWT HS256, go-playground/validator, and a storage abstraction with local-disk and S3 drivers.
+- Configuration comes from environment variables. `godotenv` loads `.env` during development.
+- Some components exist but their wiring is still commented out in `main.go`: database, JWT service, `health`, and `auth`. The `openDatabase` and `setupJWTService` helpers are ready to use when those components are enabled.
 
 ## 2. Architecture style
 
@@ -43,13 +42,13 @@ Rules that follow from this:
 - `main.go` is the only place that knows all concrete types.
 - The core is testable with stubs because it has no infrastructure dependency.
 
-This project deliberately uses **consumer-declared ports** instead of one central `ports` package. The module that needs the capability declares the smallest interface it needs. That keeps modules independent and avoids a shared package that every module depends on.
+This project deliberately uses **consumer-declared ports** instead of one central `ports` package. The module that needs the capability declares the smallest interface it needs. That keeps modules independent and avoids a shared package that every module depends on. Small modules may declare the port in the file that uses it; see `Pinger` in `internal/health/handler.go`.
 
 ## 3. Module structure
 
-A module is one feature folder under `internal/`. One folder is one Go package.
+A module is one feature folder under `internal/`. One folder is one Go package. Current modules: `auth`, `health`, and `hello`.
 
-Canonical layout for a module with business rules and persistence:
+Canonical layout for a module with business rules and persistence. Small modules only keep the files they need:
 
 ```text
 internal/event/
@@ -76,7 +75,7 @@ internal/event/
 
 Rules:
 
-1. Do not create subpackages for one feature unless the feature becomes genuinely independent. Split files by concern instead. In `internal/post`, `comment_*.go` and `postlike_*.go` are examples.
+1. Do not create subpackages for one feature unless the feature becomes genuinely independent. Split files by concern instead. In `internal/auth`, `jwt.go`, `middleware.go`, `repository.go`, and `service.go` are examples.
 2. Keep the package name equal to the folder name.
 3. Keep feature-specific code in the feature. Do not move it to `platform` just because it is reusable in theory.
 4. Do not import another module's types, errors, or services. Use a port instead. See section 4.
@@ -107,10 +106,9 @@ flowchart LR
 
 Example from the current code:
 
-- `internal/post` declares `MembershipChecker` and `UserStatusReader` in its own `domain.go`.
-- `community.Service` satisfies `MembershipChecker` structurally; its repository only reads membership data and the service owns the posting policy.
-- `auth.UserRepository` satisfies `UserStatusReader` structurally.
-- `main.go` injects both into the post services. `internal/post` never imports `internal/community` or `internal/auth`.
+- `cmd/api` builds the middleware with `auth.JWTMiddleware(jwtService)` and passes it as a parameter into `RegisterRoutes`. Route files receive the middleware without importing `internal/auth`.
+- A module that needs data from another module declares a small port in its own `domain.go`, and `main.go` injects the implementation.
+- `platform/identity` stores the authentication result in the request context, so modules do not need to know how a token is created or validated.
 
 If a provider's method set does not match the port:
 
@@ -126,44 +124,59 @@ Enforcement: code review must reject feature-to-feature imports. If we add a lin
 
 `cmd/api/main.go` is the composition root. It is the only file allowed to know every concrete implementation.
 
-Wiring order:
+Wiring order used today:
 
 ```text
-config -> logger -> database -> repositories -> shared services -> feature services -> routes -> server start
+config -> logger -> storage -> files -> routes -> server start
 ```
 
-Shape of the wiring:
+When database and authentication are enabled, the order becomes:
+
+```text
+config -> logger -> database -> repositories -> services -> middleware -> routes -> server start
+```
+
+Shape of the wiring in `cmd/api/main.go`:
 
 ```go
-cfg, err := config.LoadConfig()
+cfg, err := loadConfig()
 
-database, err := db.NewPostgres(db.DBConfig{...})
-defer database.Close()
+setupLogger(cfg)
+defer logger.Close()
 
 startupCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 defer cancel()
 
-profanityRepository := profanity.NewRepository(database)
-profanityService, err := profanity.NewService(startupCtx, profanityRepository)
+server := platformhttp.NewServer(cfg.HTTPPort)
 
-contentCleaner := contentcleaner.New()
+fileStore, err := storage.New(startupCtx, cfg.Storage)
+defer fileStore.Close()
 
-postRepository := post.NewPostRepository(database)
-commentRepository := post.NewCommentRepository(database)
-postLikeRepository := post.NewPostLikeRepository(database)
-communityRepository := community.NewCommunityRepository(database)
-communityService := community.NewService(communityRepository)
+fileService, err := files.New(files.Config{
+    Store:            fileStore,
+    BaseURL:          cfg.AppURL,
+    SigningKey:       cfg.Storage.SigningKey,
+    RequireSignature: cfg.Storage.RequireSignature,
+})
+
+hello.RegisterRoutes(server.Echo())
+server.Static(files.RoutePattern, files.RoutePrefix, fileService)
+```
+
+The database and auth blocks are prepared but still commented out:
+
+```go
+database, err := openDatabase(cfg)
+defer database.Close()
+
+jwtService, err := setupJWTService(cfg)
+
 userRepository := auth.NewUserRepository(database)
 authService := auth.NewUserService(userRepository)
-
-postService := post.NewService(postRepository, communityService, userRepository, contentCleaner, profanityService)
-commentService := post.NewCommentService(postRepository, commentRepository, communityService, userRepository, contentCleaner, profanityService)
-postLikeService := post.NewPostLikeService(postRepository, postLikeRepository, communityService, userRepository)
-
 protected := auth.JWTMiddleware(jwtService)
 
+health.RegisterRoutes(server.Echo(), database)
 auth.RegisterRoutes(server.Echo(), protected, authService)
-post.RegisterRoutes(server.Echo(), protected, postService, commentService, postLikeService)
 ```
 
 Rules:
@@ -176,6 +189,7 @@ Rules:
 6. Validate required startup configuration in `main.go` (JWT secret, TTL, database connection) and fail fast.
 7. Register routes after all services exist.
 8. Keep startup side effects in `main.go`: config, logger, database, background loaders.
+9. Shut down through `signal.NotifyContext` and `server.Start(ctx)`; let the server finish in-flight requests (10-second graceful timeout).
 
 ## 6. Adding a new module
 
@@ -196,9 +210,9 @@ import (
 )
 
 type Event struct {
-    ID          int       `json:"id"`
-    CommunityID int       `json:"community_id"`
-    CreatedAt   time.Time `json:"created_at"`
+    ID        int       `json:"id"`
+    UserID    string    `json:"user_id"`
+    CreatedAt time.Time `json:"created_at"`
 }
 
 type Repository interface {
@@ -206,8 +220,8 @@ type Repository interface {
     CreateEvent(ctx context.Context, params CreateEventParams) (*Event, error)
 }
 
-type MembershipChecker interface {
-    IsMember(ctx context.Context, communityID int, userID int) (bool, error)
+type UserStatusReader interface {
+    IsActive(ctx context.Context, userID string) (bool, error)
 }
 ```
 
@@ -215,7 +229,7 @@ Declare only the methods the module actually uses. A port is not a copy of anoth
 
 ### Step 3: implement the repository adapter
 
-- Use `$1` placeholders.
+- Use the placeholder style of the driver: `$1` for PostgreSQL/pgx, `?` for MySQL.
 - Put `ctx` first in every method.
 - Wrap DB errors with a sentinel and `%w`.
 - Attach the stack once where the error is created: `logger.WithStack(...)`.
@@ -227,14 +241,14 @@ Declare only the methods the module actually uses. A port is not a copy of anoth
 
 - Accept ports through the constructor.
 - Apply business rules and return sentinel errors.
-- Clean every user-generated string in this order: trim, `Clean`, `Filter`, then check empty and length.
+- Clean every user-generated string before storing it, then re-check emptiness and length. `platform/contentcleaner` provides trim, HTML sanitize, linkify, and email/phone masking.
 - Never write SQL, HTTP status codes, or `echo` types.
 
 ### Step 5: define errors and mapping
 
 - One sentinel per business rule.
 - One `MapError` branch per sentinel.
-- Keep status codes and messages aligned with Laravel.
+- Keep status codes and messages consistent with the API contract.
 - Field-level errors return `422` with an `errors` map keyed by the JSON field.
 
 ### Step 6: implement the handler
@@ -243,7 +257,7 @@ Declare only the methods the module actually uses. A port is not a copy of anoth
 - Validate with `c.Validate`; failures return `422`.
 - Use the existing `notblank` tag for whitespace-only rejection.
 - If you add a new validation tag, add a case to `platform/http/validator.go`.
-- Read the numeric user ID with `identity.UserIDInt(c)`; use `identity.UserID(c)` only when the raw string subject is needed.
+- Read the user ID with `identity.UserID(c)` or `identity.UserIDInt(c)`. Both return `(value, bool)`; treat `false` as `401`.
 - Return all service errors through the module's `writeError`.
 
 ### Step 7: register routes
@@ -263,12 +277,12 @@ func RegisterRoutes(e *echo.Echo, protected echo.MiddlewareFunc, service *Servic
 
 ```go
 eventRepository := event.NewEventRepository(database)
-eventService := event.NewService(eventRepository, communityRepository)
+eventService := event.NewService(eventRepository, userStatusReader)
 
 event.RegisterRoutes(server.Echo(), protected, eventService)
 ```
 
-If `communityRepository` does not satisfy `event.MembershipChecker`, create an adapter in `main.go` and inject that adapter. Do not import `community` from `event`.
+If a provider does not satisfy the port declared by `event`, create an adapter in `main.go` and inject that adapter. Do not import the provider from the `event` package.
 
 ### Step 9: test
 
@@ -284,7 +298,7 @@ If `communityRepository` does not satisfy `event.MembershipChecker`, create an a
 | Package | Capability |
 | --- | --- |
 | `platform/config` | Loads environment variables into a typed `Config`. Add new variables here. |
-| `platform/db` | Opens PostgreSQL through pgx and configures the connection pool. Returns `*sql.DB`. |
+| `platform/db` | Opens PostgreSQL through pgx (and MySQL through go-sql-driver), configures the connection pool, and pings at startup. Returns `*sql.DB`. |
 | `platform/logger` | Process logger, request-scoped logger, error helper, one-time stack attachment. |
 | `platform/http` | Echo server, middleware stack, response envelope, request validator, central `HTTPErrorHandler`. |
 | `platform/identity` | Stores and reads the authenticated user ID in the request context. |
@@ -295,7 +309,24 @@ If `communityRepository` does not satisfy `event.MembershipChecker`, create an a
 
 `internal/platform/http` has the package name `http`, so import it as `platformhttp` to avoid shadowing the standard library.
 
-`auth`, `community`, and `profanity` are modules, not platform. Depend on them through ports and inject them in `main.go`.
+Every JSON response uses the same envelope. `success` is `true` when `code < 400`, and `errors` only appears on a validation failure:
+
+```json
+{
+  "success": false,
+  "code": 422,
+  "message": "The given data was invalid.",
+  "errors": {
+    "content": ["The content field is required."]
+  }
+}
+```
+
+Framework errors (404, 405, 413) and recovered panics also pass through the same handler, so the response shape stays consistent. Exception: `platform/files` writes file bytes through `http.ServeContent`, so it follows `net/http` semantics (Range, HEAD) instead of the envelope.
+
+`NewServer` installs the middleware in this order: `RequestID`, request logger context, `Recover`, 2 MiB `BodyLimit`, then the access log. It also registers the validator and `HTTPErrorHandler`, so features do not mount them themselves.
+
+`auth`, `health`, and `hello` are modules, not platform. Depend on them through ports and inject them in `main.go`.
 
 Common APIs:
 
@@ -310,8 +341,8 @@ logger.Ctx(ctx)         // inside a request; includes request_id
 logger.Err(ctx, err)    // log once at the decision boundary
 logger.WithStack(err)   // once, where the error was born
 
-identity.UserID(c)      // string subject from the JWT
-identity.UserIDInt(c)   // numeric subject, when sub is numeric
+identity.UserID(c)      // (string, bool) subject from the JWT
+identity.UserIDInt(c)   // (int, bool) numeric subject, when sub is numeric
 ```
 
 How to decide where new shared code goes:
@@ -333,7 +364,7 @@ Rules for `platform`:
 5. Add tests when adding a platform capability.
 6. Do not create a `common`, `helpers`, or `utils` dumping ground. Name the package after the capability.
 
-Shared service modules such as `profanity` are not platform. Treat them like any other module: depend on them through an interface and inject them in `main.go`.
+Shared service modules are not platform. Treat them like any other module: depend on them through an interface and inject them in `main.go`.
 
 ## 8. Team rules
 
@@ -354,7 +385,7 @@ Shared service modules such as `profanity` are not platform. Treat them like any
 13. Enforce uniqueness with a database constraint plus `ON CONFLICT` or retry. Never rely on check-then-insert.
 14. Use a transaction when one request writes to multiple tables.
 15. Validate required configuration at startup and fail fast.
-16. Match Laravel behavior and add tests for new rules. `go vet ./...` and `go test ./...` must pass.
+16. Add tests for new rules. `go vet ./...`, `go test ./...`, and `go build ./...` must pass.
 
 ### SHOULD
 
@@ -373,32 +404,10 @@ Shared service modules such as `profanity` are not platform. Treat them like any
 3. Never use a package-level database handle or service.
 4. Never put business logic in a handler "for now".
 5. Never import another feature module, even for a small type.
-6. Never add a migration or schema change here.
 
-## 9. Laravel parity and schema
+## 9. Docker
 
-For every ported endpoint, compare:
-
-1. HTTP method and route path.
-2. Authentication and authorization rules.
-3. Validation rules and exact JSON field keys.
-4. Status codes and error messages.
-5. Success response shape.
-6. Permission rules: membership, moderator/co-moderator, mute.
-7. Side effects: notifications, mentions, missions, referrals, counters.
-8. Soft-delete behavior and timestamps.
-9. Default ordering, filtering, and pagination.
-
-The database schema is owned by Laravel:
-
-1. Do not add migrations here.
-2. If the schema is missing a column or index, raise it with the Laravel owners.
-3. Read the Laravel schema as the source of truth. Do not guess column names or types.
-4. Document approved deviations in the pull request and in a short code comment.
-
-## 10. Docker
-
-Run from the repository root. Both compose files read `.env`.
+Run from the repository root. Both compose files read `.env`, use container name `rabbitmq-example`, and map port `8090:8090`.
 
 Development with hot reload:
 
@@ -416,25 +425,27 @@ Differences:
 
 | File | Behavior |
 | --- | --- |
-| `docker-compose.dev.yml` | Uses `Dockerfile.dev`, mounts the source into `/app`, and runs `air`. Code changes trigger a rebuild. |
-| `docker-compose.yml` | Uses `Dockerfile`, builds a binary, and runs it without the source mount. Use it to verify the real build. |
+| `docker-compose.dev.yml` | Uses `Dockerfile.dev` (Go image + `air`), mounts the whole source into `/app`, and runs `air -c .air.toml`. Code changes trigger a rebuild. |
+| `docker-compose.yml` | Uses a multi-stage `Dockerfile`: builds the binary on `golang:1.27-alpine`, then runs it on `alpine` without the source. Use it to verify the real build. |
 
-Both expose port `8090`, use container name `rabbitmq-example`, and write logs to `./logs`. Use `docker logs -f rabbitmq-example` to follow logs. Rebuild with `--build` after changing dependencies, Dockerfiles, or compose files.
+Both write logs to `./logs` and store uploads in `./storage/app`, so that data survives a container rebuild. `HTTP_PORT` in `.env` must match the port mapping in the compose file, and `LOG_FILE` must stay inside `/app/logs`.
 
-## 11. Testing and commands
+PostgreSQL runs on the host, so `DB_HOST` must be `host.docker.internal` when using Docker. Use `docker logs -f rabbitmq-example` to follow the log. Rebuild with `--build` after changing dependencies, Dockerfiles, or compose files.
+
+## 10. Testing and commands
 
 ```bash
 go vet ./...
 go test ./...
-go test ./internal/post -cover
+go test ./internal/auth -cover
 go build ./...
 ```
 
 Conventions:
 
-- Service tests use hand-written stubs. Do not add a mocking library without agreement.
-- Repository tests cover row mapping with a fake `rowScanner`; add an integration test when a query needs real SQL verification.
-- Route tests assert status codes and the response envelope.
-- Health tests use a fake pinger.
+- Service and consumer tests use hand-written fakes. Examples: `fakeUserRepository` in `auth` and `fakePinger` in `health`. Do not add a mocking library without agreement.
+- Repository tests, when added, cover row mapping with a fake `rowScanner`; add an integration test when a query needs real SQL verification.
+- Route tests use `echo.New()` or `platformhttp.NewServer("0")` plus `httptest`, then assert the status code and the response envelope.
+- Platform packages have their own tests for the validator, response envelope, file serving and signed URLs, storage round trips, and logger output. Run them when changing `internal/platform`.
 - Add or update tests in the same pull request as the rule change.
 
