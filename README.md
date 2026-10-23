@@ -4,6 +4,12 @@ End-to-end RabbitMQ example in Go. A publisher receives messages over HTTP and s
 
 The services use the official RabbitMQ AMQP 1.0 Go client (`github.com/rabbitmq/rabbitmq-amqp-go-client`), Echo v5, and zerolog.
 
+## Demo
+
+https://github.com/user-attachments/assets/1ea0b712-8685-4359-8c74-d8f3bf1802c2
+
+_Publishing from the form on port 8090, received live over SSE on port 8091._
+
 ## Architecture
 
 ```mermaid
